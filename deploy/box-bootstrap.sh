@@ -144,7 +144,7 @@ install -o "$BOX_USER" -g "$BOX_USER" -m 644 "$ROOT/toolkit/guard/golden_guard.p
 install -o "$BOX_USER" -g "$BOX_USER" -m 644 "$ROOT/toolkit/merge/merge_branch.py"     "$HOMEDIR/.hermescoder/merge_branch.py"
 install -o "$BOX_USER" -g "$BOX_USER" -m 755 "$ROOT/toolkit/install_skill.py"          "$HOMEDIR/.hermescoder/install_skill.py"
 install -o "$BOX_USER" -g "$BOX_USER" -m 755 "$ROOT/toolkit/optimize_skill.py"         "$HOMEDIR/.hermescoder/optimize_skill.py"
-install -o "$BOX_USER" -g "$BOX_USER" -m 644 "$ROOT/identity/GOLDEN-RULES.md"          "$HOMEDIR/.hermescoder/GOLDEN-RULES.md"
+install -o "$BOX_USER" -g "$BOX_USER" -m 644 "$HERE/templates/GOLDEN-RULES.template.md" "$HOMEDIR/.hermescoder/GOLDEN-RULES.md"
 install -o "$BOX_USER" -g "$BOX_USER" -m 644 "$HERE/templates/merge-policy.json" "$HOMEDIR/.hermescoder/merge-policy.json"
 as_user "mkdir -p ~/.hermescoder/agents"
 install -o "$BOX_USER" -g "$BOX_USER" -m 644 "$ROOT"/identity/agents/*.md "$HOMEDIR/.hermescoder/agents/"

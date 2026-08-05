@@ -26,13 +26,23 @@ boards, old laptops, and 2-vCPU budget VPSes are all comfortable homes.
 > Community project on top of [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent)
 > (MIT) — not an official Nous Research or Anthropic product.
 
+## Why we built it
+
+We wanted a **subscription-enabled Claude Agent SDK agent, hermes flavor**: the
+Agent SDK's full harness (tools, sessions, permissions, skills) running under
+the Claude plan we already pay for — no metered API bill for a bot that thinks
+all day — wrapped in everything hermes-agent does well: the Telegram-native
+gateway, plugins, cron, skills, multi-provider engine. Neither existed as one
+thing, so we wired the SDK in as a hermes-agent provider ([PR #65982](https://github.com/NousResearch/hermes-agent/pull/65982)),
+ran it 24/7 on our own boxes, and packaged the whole runbook as this repo.
+
 ## What you get
 
 | Piece | What it does |
 |---|---|
 | `deploy/` | `box-bootstrap.sh` — one script from fresh Debian to running agent: system deps, engine, venv, identity, config, systemd user units. Fill `box.env` from the template, run, done. |
 | `toolkit/` | delegate (agent writes code on a branch, you get a verdict), guard (golden-rules enforcement), merge (owner-granted merges only, `agent/*` branch namespace) |
-| `zvec-memory/` | semantic recall over the agent's memories (zvec + embeddings; Jina quality lane or local-only fallback) |
+| `zvec-memory/` | semantic recall over the agent's memories — zvec + [jina.ai](https://jina.ai) embeddings (`jina-embeddings-v4`, 2048-dim) when `JINA_API_KEY` is set; falls back to local bge-small with no key (works, weaker recall) |
 | `watchers/` | pr-watch (pages you on PR changes), resource-watch (disk/mem/load for small boxes) — env-driven, fail-closed, state kept beside the script |
 | `skills/` | agent-face (talking-head UI for your agent), coder-delegate, fleet-ssh, merge-grant |
 | `deploy/templates/` | identity (SOUL/USER), config, systemd unit, settings — everything placeholder-templated; your agent's name, owner, and channels are yours |
@@ -71,6 +81,22 @@ and is submitted upstream: PRs
 [#74238](https://github.com/NousResearch/hermes-agent/pull/74238);
 [#72002](https://github.com/NousResearch/hermes-agent/pull/72002) is already
 merged upstream. Everything deployed here is public code at a pinned SHA.
+
+## Golden rules of coding
+
+The agent doesn't just write code — it works under **golden rules**: a short
+file of hard, non-negotiable rules (tests-first with 80%+ coverage, ~900-line
+file ceiling, no fake in-memory persistence in production paths, lint and
+vulnerability checks fail-closed, never a metered API key in the repo). The
+bootstrap installs a starter set from
+[`deploy/templates/GOLDEN-RULES.template.md`](deploy/templates/GOLDEN-RULES.template.md)
+— edit it, make the rules yours.
+
+What makes them golden is enforcement, not prose: `toolkit/guard/golden_guard.py`
+is a **deterministic, zero-LLM gate** — exit code is the verdict — that checks
+every delegated run, and the merge tool re-runs the full guard on the branch tip
+before anything lands. Drafts live on `agent/*` branches; merges happen only on
+your explicit grant.
 
 ## Security posture
 
