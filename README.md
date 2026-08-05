@@ -4,18 +4,27 @@
 powered by your Claude subscription, no API bill.**
 
 hermesCoder turns a fresh Debian machine into a full autonomous-agent stack built
-on [hermes-agent](https://github.com/NousResearch/hermes-agent): a Telegram-native
-gateway running Claude through the official Agent SDK (subscription OAuth,
-fail-closed billing), semantic long-term memory, a delegate/guard/merge toolkit
-for real repo work, and watchdogs that page you when something needs eyes.
+on [hermes-agent](https://github.com/NousResearch/hermes-agent). At its core is
+the [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk) — Anthropic's
+official agent runtime, the same harness that powers Claude Code — wired into
+hermes-agent as a first-class model provider under subscription OAuth with
+fail-closed billing. The same Claude plan you already pay for drives your agent
+around the clock. That provider is our work, submitted upstream as
+[PR #65982](https://github.com/NousResearch/hermes-agent/pull/65982) — the PR
+that makes this stack possible.
 
-**It runs anywhere — and runs smooth on small hardware.** A Raspberry Pi 5 runs
-the full stack 24/7 in production; mini PCs, Radxa boards, old laptops, and
-2-vCPU budget VPSes are all comfortable homes. If it boots Debian, it can host
-your coder.
+Around the engine: a Telegram-native gateway (your coder is one chat away,
+wherever you are), semantic long-term memory, a delegate/guard/merge toolkit for
+real work on your own repos, and watchdogs that page you when something needs
+eyes.
+
+**Runs anywhere.** A Hetzner VPS, the machine under your desk, a Raspberry Pi —
+if it boots Debian, it can host your coder. The full stack runs smooth on small
+hardware: a Raspberry Pi 5 carries it 24/7 in production, and mini PCs, Radxa
+boards, old laptops, and 2-vCPU budget VPSes are all comfortable homes.
 
 > Community project on top of [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent)
-> (MIT) — not an official Nous Research product.
+> (MIT) — not an official Nous Research or Anthropic product.
 
 ## What you get
 
