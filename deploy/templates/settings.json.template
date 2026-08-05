@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:*)",
+      "Bash(__HOME__/.hermes/hermes-agent/venv/bin/python __HOME__/.hermescoder/delegate_coder.py:*)",
+      "Bash(__HOME__/.hermes/hermes-agent/venv/bin/python __HOME__/.hermescoder/merge_branch.py:*)",
+      "Bash(python3 __HOME__/.hermescoder/install_skill.py:*)",
+      "Bash(python3 __HOME__/.hermescoder/optimize_skill.py:*)",
+      "Bash(__HOME__/.hermes/hermes-agent/venv/bin/hermes cron:*)",
+      "Bash(__HOME__/.hermes/hermes-agent/venv/bin/hermes skills:*)",
+      "mcp__hermes-tools__memory",
+      "mcp__hermes-tools__session_search",
+      "mcp__zvec-memory__memory_semantic_search",
+      "mcp__zvec-memory__memory_index_status"
+    ]
+  }
+}

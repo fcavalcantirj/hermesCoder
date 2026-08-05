@@ -1,0 +1,25 @@
+# secrets / local state — never committed
+.env
+*.env
+box.env
+!deploy/templates/env.template
+*.state
+watch.log
+merges.jsonl
+runs/
+
+# engine clone (public lane drops it beside the checkout)
+.engine/
+
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+venv/
+.venv/
+
+# node
+node_modules/
+
+# macOS
+.DS_Store
