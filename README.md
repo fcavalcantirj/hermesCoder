@@ -49,7 +49,17 @@ ran it 24/7 on our own boxes, and packaged the whole runbook as this repo.
 
 ## Quickstart
 
-On a fresh Debian 12/13 box (Pi, mini PC, VPS — root):
+> ### ⚡ Don't read docs — paste one prompt
+>
+> **The fastest way to get running: [the hermesCoder setup prompt](https://gist.github.com/fcavalcantirj/2475371cf893fe16c6ed767fd127e23d).**
+> Paste it into Claude Code (or any capable coding agent) and it drives the
+> whole thing for you: asks where to run (this machine, a VPS, a Pi), names
+> your agent, walks you through the Telegram bot and Claude subscription
+> tokens, sells you the free [jina.ai](https://jina.ai) memory upgrade, runs
+> the install, and **verifies everything before claiming it's done**. Ten
+> minutes, mostly spent thinking of a good name.
+
+Prefer to drive it yourself? On a fresh Debian 12/13 box (Pi, mini PC, VPS — root):
 
 ```bash
 git clone https://github.com/fcavalcantirj/hermesCoder.git
