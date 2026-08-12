@@ -427,3 +427,84 @@ def test_filter_excludes_each_reason(mem, bad_kind, bad_row):
     res = core.search("refactor the goroutine pool", top_k=50, lane="local")
     got = {_mid_int(r["message_id"]) for r in res["results"]}
     assert got == {1}, "only the valid row (id 1) should be indexed for %s" % bad_kind
+
+
+# =========================================================================== #
+# Case 9 — archive kind is DERIVED from the snippet head; scope="archives"
+# returns only MEMORY ARCHIVE rows; scope="all" tags kind on every result.
+# Guards the archive-before-compact recall lane (2026-08-12).
+# =========================================================================== #
+def _archive_row(mid, slug, body, session_id="s-0"):
+    content = "\U0001F5C4️ MEMORY ARCHIVE — %s: %s" % (slug, body)
+    return _row(mid, role="assistant", content=content, session_id=session_id)
+
+
+def test_case9_scope_archives_filters_and_tags(mem):
+    rows = _valid_rows(5) + [
+        _archive_row(90, "goroutine-pool-history",
+                     "the goroutine pool was refactored to use context deadlines"),
+        _archive_row(91, "flock-timeout-choice",
+                     "flock acquire uses a poll timeout and raises StoreBusy on expiry"),
+        # mentions the marker mid-content — must stay kind=chat (no line-start + "— ")
+        _row(92, role="user",
+             content="please explain what a MEMORY ARCHIVE paragraph is for"),
+        # the LIVE shape (2026-08-12): archive paragraph EMBEDDED in a longer
+        # reply, marker at a line start mid-message — must tag as archive
+        _row(93, role="assistant", content=(
+            "Both repairs are in; the store is at 85%. Archiving before the batch:\n\n"
+            "\U0001F5C4️ MEMORY ARCHIVE — goroutine-watchdog-lesson: the watchdog "
+            "must disarm when the goroutine pool drains, never on a timer alone.\n\n"
+            "Now running the closing batch."
+        ), session_id="s-1"),
+    ]
+    _build_state_db(mem.state_db, rows)
+    core.index_catchup()
+
+    res_all = core.search("goroutine pool context deadline", top_k=50, lane="local")
+    assert res_all["scope"] == "all"
+    kinds = {_mid_int(r["message_id"]): r["kind"] for r in res_all["results"]}
+    assert kinds[90] == "archive" and kinds[91] == "archive"
+    assert kinds[92] == "chat", "mid-content marker mention must not tag as archive"
+    assert kinds[93] == "archive", "embedded archive paragraph must tag as archive"
+    assert all(kinds[m] == "chat" for m in kinds if m not in (90, 91, 93))
+
+    res_arch = core.search("goroutine pool context deadline", top_k=50,
+                           lane="local", scope="archives")
+    assert res_arch["scope"] == "archives"
+    got = {_mid_int(r["message_id"]) for r in res_arch["results"]}
+    assert got == {90, 91, 93}, "archives scope must return exactly the archive rows, got %r" % got
+    assert all(r["kind"] == "archive" for r in res_arch["results"])
+
+
+def test_case9b_scope_validation_and_topk_cap(mem):
+    _build_state_db(mem.state_db, _valid_rows(3) + [
+        _archive_row(90, "only-archive", "a single archived entry about flock timeouts"),
+    ])
+    core.index_catchup()
+
+    with pytest.raises(ValueError):
+        core.search("anything", scope="archive")  # singular: explicit error, not a guess
+
+    res = core.search("flock timeouts", top_k=1, lane="local", scope="archives")
+    assert res["count"] <= 1, "top_k must cap the post-filter result set"
+    if res["results"]:
+        assert res["results"][0]["kind"] == "archive"
+
+
+# =========================================================================== #
+# Case 10 — snippets embed/store up to SNIPPET_MAX (1000) chars, so an archive
+# entry's distinctive tail (past the old 300-char cap) is still searchable.
+# =========================================================================== #
+def test_case10_snippet_stores_1000_chars(mem):
+    filler = "the merge gate reads policy from merge-policy.json and refuses dirty trees. " * 8
+    tail = "the distinctive tail phrase is quetzal-parser-tables"
+    body = filler + tail          # tail lands past 300 but inside 1000
+    assert 300 < body.index(tail) < core.SNIPPET_MAX - len(tail)
+    rows = [_archive_row(90, "long-entry", body)] + _valid_rows(3, start=1)
+    _build_state_db(mem.state_db, rows)
+    core.index_catchup()
+
+    res = core.search("quetzal-parser-tables", top_k=5, lane="local", scope="archives")
+    snip = res["results"][0]["snippet"] if res["results"] else ""
+    assert tail in snip, "snippet must carry content past the old 300-char cap"
+    assert len(snip) <= core.SNIPPET_MAX

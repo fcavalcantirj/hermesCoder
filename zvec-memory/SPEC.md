@@ -38,8 +38,12 @@ Layout under the dir: `collection/` (zvec), `watermark.json` (`{"last_id": N}`),
 
 Collection: name `hermes_memory`; vectors `v_local` (384, Flat/COSINE) + `v_jina`
 (2048, Flat/COSINE); doc id = `m<message_rowid>`. Metadata (session_id, role, timestamp,
-snippet ≤300 chars) via zvec `FieldSchema` scalar fields if the API cooperates, else a
-sidecar `meta.json` — implementer's choice, but results MUST return the metadata.
+snippet ≤1000 chars — was ≤300 until 2026-08-12; per-doc stored snippet keeps old docs
+self-consistent, no reindex) via zvec `FieldSchema` scalar fields if the API cooperates,
+else a sidecar `meta.json` — implementer's choice, but results MUST return the metadata.
+Archive rows (the archive-before-compact memory convention, `🗄️ MEMORY ARCHIVE — <slug>:
+<verbatim entry>`) carry NO schema field: `kind` is DERIVED at search time from the stored
+snippet head, so the store stays derived-only and rebuildable.
 
 Embedder seam (monkeypatchable module functions):
 - `embed_local(texts) -> list[vec384]` — lazy fastembed singleton.
@@ -63,14 +67,17 @@ Embedder seam (monkeypatchable module functions):
 snippets (`retrieval.passage`), `coll.update`/`upsert` their `v_jina`, drop from pending.
 Failures leave ids queued. Returns count.
 
-`search(query, top_k=5, lane="auto")`:
+`search(query, top_k=5, lane="auto", scope="all")`:
 - `auto`: jina when key file present → embed query `retrieval.query`, search `v_jina`;
   ANY jina failure ⇒ degrade to local and set `"degraded": "jina-unavailable: <reason>"`
   in the result (never silently switch). `local` / `jina` force a lane.
-- Returns `{"success": true, "lane": ..., "count": n, "results": [{"message_id",
-  "session_id", "role", "timestamp", "snippet", "distance"}...], "index": {"watermark",
-  "pending_jina", "doc_count"}}` — a 0-count with a healthy index is an HONEST zero
-  (success true), the index block making staleness visible.
+- `scope`: `all` searches everything; `archives` overfetches (8×top_k, floor 50, cap 200)
+  then keeps only rows whose snippet HEAD carries `MEMORY ARCHIVE` (short emoji/symbol
+  prefix allowed, a mid-content mention stays chat). Unknown scope ⇒ ValueError.
+- Returns `{"success": true, "lane": ..., "scope": ..., "count": n, "results": [{"message_id",
+  "session_id", "role", "timestamp", "snippet", "kind": "archive"|"chat", "distance"}...],
+  "index": {"watermark", "pending_jina", "doc_count"}}` — a 0-count with a healthy index
+  is an HONEST zero (success true), the index block making staleness visible.
 
 Locking: `flock` (LOCK_EX, 20 s poll-timeout) around any collection open (index, backfill,
 search all take it — single-owner store). Timeout ⇒ raise `StoreBusy`.
@@ -78,7 +85,7 @@ search all take it — single-owner store). Timeout ⇒ raise `StoreBusy`.
 ## Server (`zvec_memory_server.py`)
 
 FastMCP, name `zvec-memory`, two tools:
-- `memory_semantic_search(query: str, top_k: int = 5, lane: str = "auto") -> str` —
+- `memory_semantic_search(query: str, top_k: int = 5, lane: str = "auto", scope: str = "all") -> str` —
   flock → `index_catchup()` → `backfill_jina()` → `search()`; returns the JSON above.
   `StateDBUnavailable` ⇒ `{"success": false, "error": "state DB not found/unreadable: <path>"}`;
   `StoreBusy` ⇒ `{"success": false, "error": "memory store busy, retry"}`. Exceptions

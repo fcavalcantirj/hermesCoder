@@ -29,8 +29,22 @@ import zvec
 COLLECTION_NAME = "hermes_memory"
 LOCAL_DIM = 384
 JINA_DIM = 2048
-SNIPPET_MAX = 300
+SNIPPET_MAX = 1000
 MIN_CONTENT_LEN = 12
+# Archive rows are ordinary messages that follow the archive-before-compact
+# convention ("🗄️ MEMORY ARCHIVE — <slug>: <verbatim entry>"). The kind is
+# DERIVED from the stored snippet at search time — no schema field, so the
+# live collection needs no rebuild and the store stays derived-only.
+ARCHIVE_MARKER = "MEMORY ARCHIVE"
+# A line opening with the marker + em-dash structure ("🗄️ MEMORY ARCHIVE — slug:").
+# Line-anchored + structure-requiring: archives ride EMBEDDED in longer replies
+# (verified live 2026-08-12 — head-only detection returned 0 on 9 real archive
+# messages), while a prose mention of the phrase lacks the line-start + "— ".
+_ARCHIVE_LINE_RE = None  # compiled lazily; module import stays cheap
+# scope="archives" post-filters rare rows out of a mostly-chat index, so the
+# query overfetches before filtering down to top_k.
+_ARCHIVE_OVERFETCH_MIN = 50
+_ARCHIVE_OVERFETCH_CAP = 200
 JINA_BATCH_MAX = 128
 LOCK_TIMEOUT_S = 20.0  # tests shrink this; poll interval stays fixed
 _LOCK_POLL_S = 0.2
@@ -377,11 +391,29 @@ def backfill_jina(cap: int = 64) -> int:
     return len(done)
 
 
-def search(query: str, top_k: int = 5, lane: str = "auto") -> dict:
+def _is_archive(snippet: str) -> bool:
+    """True when any LINE of the snippet opens an archive paragraph:
+    optional short emoji/symbol prefix, then "MEMORY ARCHIVE — ". A prose
+    mention of the phrase (mid-line, or without the em-dash) stays chat."""
+    global _ARCHIVE_LINE_RE
+    if _ARCHIVE_LINE_RE is None:
+        import re
+
+        _ARCHIVE_LINE_RE = re.compile(
+            r"^[^\w\n]{0,8}" + ARCHIVE_MARKER + r" — ", re.MULTILINE
+        )
+    return _ARCHIVE_LINE_RE.search(snippet) is not None
+
+
+def search(query: str, top_k: int = 5, lane: str = "auto", scope: str = "all") -> dict:
     """Semantic search. `auto` prefers jina when the key file exists and
-    DEGRADES LOUDLY to local on any jina failure (never a silent switch)."""
+    DEGRADES LOUDLY to local on any jina failure (never a silent switch).
+    `scope`: "all" searches everything; "archives" returns only rows whose
+    head carries the MEMORY ARCHIVE marker (derived at search time)."""
     if lane not in ("auto", "local", "jina"):
         raise ValueError(f"unknown lane {lane!r} (want auto|local|jina)")
+    if scope not in ("all", "archives"):
+        raise ValueError(f"unknown scope {scope!r} (want all|archives)")
     if top_k < 1:
         raise ValueError(f"top_k must be >= 1, got {top_k}")
 
@@ -407,13 +439,19 @@ def search(query: str, top_k: int = 5, lane: str = "auto") -> dict:
 
     pending = set(_read_pending(mem_dir))
 
+    # Archive rows are rare among chat rows, so the archives scope widens the
+    # query and filters down to top_k afterwards.
+    fetch_k = top_k
+    if scope == "archives":
+        fetch_k = min(max(top_k * 8, _ARCHIVE_OVERFETCH_MIN), _ARCHIVE_OVERFETCH_CAP)
+
     # Embedding happened OUTSIDE the lock (jina takes seconds); only the
     # single-owner collection open sits inside.
     with _locked(mem_dir):
         coll = _open_collection(mem_dir)
         try:
             hits = coll.query(
-                queries=zvec.Query(field_name=field, vector=qvec), topk=top_k
+                queries=zvec.Query(field_name=field, vector=qvec), topk=fetch_k
             )
             doc_count = coll.stats.doc_count
         finally:
@@ -421,9 +459,15 @@ def search(query: str, top_k: int = 5, lane: str = "auto") -> dict:
 
     results = []
     for doc in hits:
+        if len(results) >= top_k:
+            break
         if field == "v_jina" and doc.id in pending:
             continue  # zero-vector placeholder, not a real jina embedding
         f = doc.fields or {}
+        snippet = f.get("snippet") or ""
+        kind = "archive" if _is_archive(snippet) else "chat"
+        if scope == "archives" and kind != "archive":
+            continue
         results.append(
             {
                 "message_id": int(doc.id[1:]),  # doc id = m<message_rowid>
@@ -431,6 +475,7 @@ def search(query: str, top_k: int = 5, lane: str = "auto") -> dict:
                 "role": f.get("role"),
                 "timestamp": f.get("timestamp"),
                 "snippet": f.get("snippet"),
+                "kind": kind,
                 "distance": doc.score,  # cosine distance, ascending = closer
             }
         )
@@ -438,6 +483,7 @@ def search(query: str, top_k: int = 5, lane: str = "auto") -> dict:
     out = {
         "success": True,
         "lane": "jina" if field == "v_jina" else "local",
+        "scope": scope,
         "count": len(results),
         "results": results,
         # index block makes staleness visible: a 0-count with a healthy

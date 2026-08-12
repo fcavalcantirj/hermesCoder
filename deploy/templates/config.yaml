@@ -559,12 +559,15 @@ memory:
   user_profile_enabled: true
 
   # Character limits (~2.75 chars per token, model-independent).
-  # 4400 = 2x the engine default (2200): a 24/7 ops box accumulates more
-  # load-bearing facts than the default assumes — at 2200 the agent spent
-  # turns trimming good entries to fit new ones (observed 2026-07-27, twice
-  # in one day). Still bounded on purpose: curation pressure stays, the
-  # per-turn cost is ~1,600 tokens.
-  memory_char_limit: 4400   # ~1,600 tokens
+  # 2200 is the engine default and, after a live experiment, the deliberate
+  # choice: 2026-07-27→08-12 this ran doubled (4400) on a 24/7 ops box and
+  # the store filled to 98% anyway — double the per-turn token cost, the
+  # same curation pressure, and the nightly consolidation began truncating
+  # entries to make room. Bounded-small is the design: MEMORY.md keeps only
+  # load-bearing facts; anything squeezed out is archived VERBATIM into the
+  # transcript ("🗄️ MEMORY ARCHIVE" messages) where session_search /
+  # memory_semantic_search scope="archives" can always retrieve it.
+  memory_char_limit: 2200   # engine default (~800 tokens)
   user_char_limit: 1375     # ~500 tokens
 
   # Periodic memory nudge: remind the agent to consider saving memories
@@ -767,6 +770,24 @@ agent:
   #   "claude-opus-4.6": "high"           # bare model name also works
   #   "deepseek/deepseek-v4-pro": "xhigh" # dots and dashes are interchangeable
   reasoning_overrides: {}
+
+  # claude-agent-sdk provider knobs. WITHOUT this block the SDK runs fully
+  # isolated (setting_sources []) and NEVER reads ~/.claude/settings.json —
+  # so the allowlist box-bootstrap.sh installs there (zvec-memory tools,
+  # cron tool grants) would be inert and headless cron turns (e.g.
+  # nightly-memory-consolidation) hit ungranted MCP tools. Gap observed on
+  # the live box 2026-07-26; templated 2026-08-12.
+  claude_agent_sdk:
+    # Load the user-scope settings (allowlist + durable grants).
+    setting_sources: ["user"]
+    # Background/out-of-turn SDK results go to the platform outbound lane.
+    deliver_background_results: true
+    # Activity-aware turn lifetime cap, seconds (W23).
+    turn_timeout: 1500
+    # permission_mode is a PER-BOX choice, deliberately not templated:
+    # "default" arms the one-tap approval bridge for un-allowlisted tools;
+    # "bypassPermissions" skips approvals entirely (deny rules still hold).
+    # permission_mode: "default"
   # Predefined personalities (use with /personality command)
   personalities:
     helpful: "You are a helpful, friendly AI assistant."

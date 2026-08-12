@@ -30,7 +30,9 @@ def _dump(obj: dict) -> str:
 
 
 @app.tool()
-def memory_semantic_search(query: str, top_k: int = 5, lane: str = "auto") -> str:
+def memory_semantic_search(
+    query: str, top_k: int = 5, lane: str = "auto", scope: str = "all"
+) -> str:
     """Semantic search over indexed conversation history — finds past
     discussions by MEANING, not keywords.
 
@@ -40,6 +42,12 @@ def memory_semantic_search(query: str, top_k: int = 5, lane: str = "auto") -> st
     session_search only when you know exact keywords/identifiers that
     appeared verbatim.
 
+    scope: "all" (default) searches every message; "archives" returns only
+    MEMORY ARCHIVE rows — the verbatim entries preserved by the
+    archive-before-compact memory convention. Use scope="archives" when
+    recalling a fact that was once in curated memory but got consolidated
+    out; each result carries kind: archive|chat either way.
+
     Catches the index up from state.db, drains a slice of the jina backfill
     queue, then searches. lane: auto (jina when key present, degrade-loud to
     local) | local | jina. Returns JSON with results + an index-health block.
@@ -47,7 +55,7 @@ def memory_semantic_search(query: str, top_k: int = 5, lane: str = "auto") -> st
     try:
         core.index_catchup()
         core.backfill_jina()
-        return _dump(core.search(query, top_k=top_k, lane=lane))
+        return _dump(core.search(query, top_k=top_k, lane=lane, scope=scope))
     except core.StateDBUnavailable as exc:
         return _dump(
             {"success": False, "error": f"state DB not found/unreadable: {exc}"}
