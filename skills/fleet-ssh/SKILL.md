@@ -18,6 +18,10 @@ The fleet table is deployment-specific — the operator fills it in on the box
 
 ## Standing rules (non-negotiable)
 
+0. **SPHERES.** This fleet is the owner's PERSONAL estate only. Enterprise/work
+   boxes are OUT OF SCOPE even if reachable — never request, hold, or accept
+   access to them; enterprise work runs on enterprise agents. Sharing the
+   hermes flavor shares code, never access.
 1. **Read-only bias.** Diagnose freely (status, logs, df, journalctl, ps).
    Any WRITE/restart/delete needs the owner's explicit ask for THAT action,
    in this conversation — never inferred, never "while I'm here".
