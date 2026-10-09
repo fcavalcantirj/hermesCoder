@@ -4,14 +4,15 @@
 powered by your Claude subscription, no API bill.**
 
 hermesCoder turns a fresh Debian machine into a full autonomous-agent stack built
-on [hermes-agent](https://github.com/NousResearch/hermes-agent). At its core is
-the [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk) — Anthropic's
-official agent runtime, the same harness that powers Claude Code — wired into
-hermes-agent as a first-class model provider under subscription OAuth with
-fail-closed billing. The same Claude plan you already pay for drives your agent
-around the clock. That provider is our work, submitted upstream as
-[PR #65982](https://github.com/NousResearch/hermes-agent/pull/65982) — the PR
-that makes this stack possible.
+on [hermes-agent](https://github.com/NousResearch/hermes-agent), pinned to an
+upstream release. Model access is your Claude Pro/Max subscription through the
+official Claude Code CLI, wired in by Nous' official catalog plugin
+[claude-subscription-directsdk](https://github.com/NousResearch/hermes-plugin-claude-subscription-directsdk):
+Hermes keeps its own agent loop, tools, approvals and compaction, and every turn
+runs on the plan you already pay for. No API key, no per-token bill.
+(The earlier in-tree Agent SDK provider we submitted as
+[PR #65982](https://github.com/NousResearch/hermes-agent/pull/65982) is retired
+in favour of that plugin — same goal, now upstream-maintained.)
 
 Around the engine: a Telegram-native gateway (your coder is one chat away,
 wherever you are), semantic long-term memory, a delegate/guard/merge toolkit for
@@ -28,24 +29,25 @@ boards, old laptops, and 2-vCPU budget VPSes are all comfortable homes.
 
 ## Why we built it
 
-We wanted a **subscription-enabled Claude Agent SDK agent, hermes flavor**: the
-Agent SDK's full harness (tools, sessions, permissions, skills) running under
-the Claude plan we already pay for — no metered API bill for a bot that thinks
-all day — wrapped in everything hermes-agent does well: the Telegram-native
-gateway, plugins, cron, skills, multi-provider engine. Neither existed as one
-thing, so we wired the SDK in as a hermes-agent provider ([PR #65982](https://github.com/NousResearch/hermes-agent/pull/65982)),
-ran it 24/7 on our own boxes, and packaged the whole runbook as this repo.
+We wanted a **subscription-powered Claude coding agent, hermes flavor**: the
+Claude plan we already pay for driving a bot that thinks all day — no metered API
+bill — wrapped in everything hermes-agent does well: the Telegram-native gateway,
+plugins, cron, skills, multi-provider engine. We first built that bridge
+ourselves (PR #65982, in production on our boxes for months); upstream then
+shipped the official plugin, which measured faster and 2–3× cheaper in tokens on
+the same tasks, so this stack now runs on it. What remains ours is everything
+around the engine, packaged as this runbook.
 
 ## What you get
 
 | Piece | What it does |
 |---|---|
-| `deploy/` | `box-bootstrap.sh` — one script from fresh Debian to running agent: system deps, engine, venv, identity, config, systemd user units. Fill `box.env` from the template, run, done. |
+| `deploy/` | `box-bootstrap.sh` — one script from fresh Debian to running agent: system deps, Claude Code CLI, the pinned hermes-agent release via upstream's own installer, the subscription plugin, identity, config, the systemd user unit. Fill `box.env` from the template, run, done. |
 | `toolkit/` | delegate (agent writes code on a branch, you get a verdict), guard (golden-rules enforcement), merge (owner-granted merges only, `agent/*` branch namespace) |
 | `zvec-memory/` | semantic recall over the agent's memories — zvec + [jina.ai](https://jina.ai) embeddings (`jina-embeddings-v4`, 2048-dim) when `JINA_API_KEY` is set; falls back to local bge-small with no key (works, weaker recall) |
 | `watchers/` | pr-watch (pages you on PR changes), resource-watch (disk/mem/load for small boxes) — env-driven, fail-closed, state kept beside the script |
 | `skills/` | agent-face (talking-head UI for your agent), coder-delegate, fleet-ssh, merge-grant |
-| `deploy/templates/` | identity (SOUL/USER), config, systemd unit, settings — everything placeholder-templated; your agent's name, owner, and channels are yours |
+| `deploy/templates/` | identity (SOUL/USER), config, golden rules, merge policy — everything placeholder-templated; your agent's name, owner, and channels are yours |
 
 ## Quickstart
 
@@ -74,23 +76,32 @@ The bootstrap installs everything, runs the engine's smoke suites on the box,
 and starts the gateway as a systemd user unit. Message your bot on Telegram —
 it's your coder now.
 
-The engine is pulled as a pinned shallow clone (`ENGINE_REF`, overridable in
-`box.env`); a checkout that vendors `hermes/` locally is used as-is instead —
-same script, two lanes.
+The engine is installed by upstream's own installer at a pinned release commit
+(`ENGINE_COMMIT`, overridable in `box.env`); the subscription plugin comes from
+the Hermes plugin catalog at the sha the catalog pins.
 
 ## Engine provenance
 
-The engine branch carries the `claude-agent-sdk` provider stack — the official
-Agent SDK as a first-class hermes-agent runtime under subscription OAuth, with
-fail-closed billing guards, session continuity, and background-task delivery.
-It lives publicly on [the fork](https://github.com/fcavalcantirj/hermes-agent)
-and is submitted upstream: PRs
-[#65982](https://github.com/NousResearch/hermes-agent/pull/65982) (the provider),
-[#65978](https://github.com/NousResearch/hermes-agent/pull/65978),
-[#72001](https://github.com/NousResearch/hermes-agent/pull/72001),
-[#74238](https://github.com/NousResearch/hermes-agent/pull/74238);
-[#72002](https://github.com/NousResearch/hermes-agent/pull/72002) is already
-merged upstream. Everything deployed here is public code at a pinned SHA.
+- **Engine:** [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent)
+  release **v0.21.6** (commit `818c13be1dc4fd28987e1e881a9408224afd4535`), installed by
+  `scripts/install.sh` at that commit (PM-managed: pinned `uv`, managed CPython 3.14,
+  venv hash-verified against `uv.lock`). Nothing is forked or vendored.
+- **Model lane:** the official catalog plugin
+  [`claude-subscription-directsdk`](https://github.com/NousResearch/hermes-plugin-claude-subscription-directsdk)
+  (tier official, v0.3.3 at `4bc79c78031d`) + the Claude Code CLI (`npm`, ≥ 2.1.293).
+  The plugin spawns `claude` once per Hermes call and inherits whatever account it
+  is logged into (`CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`).
+- **History:** the stack ran for months on our in-tree Agent SDK provider,
+  [PR #65982](https://github.com/NousResearch/hermes-agent/pull/65982) (now draft),
+  with satellites [#65978](https://github.com/NousResearch/hermes-agent/pull/65978),
+  [#72001](https://github.com/NousResearch/hermes-agent/pull/72001),
+  [#74238](https://github.com/NousResearch/hermes-agent/pull/74238);
+  [#72002](https://github.com/NousResearch/hermes-agent/pull/72002) landed upstream.
+  Upstream chose the plugin architecture (core seam #117451) and ships the
+  official plugin; we measured it against ours and moved. Everything deployed
+  here is public code at a pinned sha.
+- **Update:** bump `ENGINE_COMMIT`/`ENGINE_REF` in `box.env` and re-run the
+  bootstrap, or on the box `hermes update` (stable channel = final releases only).
 
 ## Golden rules of coding
 
