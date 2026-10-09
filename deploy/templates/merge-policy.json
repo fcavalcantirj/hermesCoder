@@ -1,3 +1,4 @@
 {
-  "_comment": "Fail-closed merge policy: a repo absent from this map cannot be merged at all. Starts EMPTY on a fresh box — add repo->targets entries only on the owner's word; deployed beside merge_branch.py (no --policy override exists, deliberately)."
+  "_comment": "OPTIONAL per-repo overrides for the merge tool and the golden guard — NOT a gate: a repo absent from this map gets the defaults (target = its default branch, tests run locally with the repo's own .venv when present). Keys per resolved checkout path: target (branch), cov_path (monorepo package to gate), python (interpreter for the test run), tests (\"ci\" = the remote CI's required checks are the test oracle and the repo lands only through the PR lane, or a list of pytest paths), cov (list of --cov targets), min_coverage (default 80). Deployed beside merge_branch.py.",
+  "repos": {}
 }

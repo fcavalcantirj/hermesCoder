@@ -197,3 +197,140 @@ def test_run_guard_verdicts(tmp_path):
     files["store.go"] = "package main\n\ntype InMemoryRepo struct{}\n"
     repo2 = make_repo(tmp_path / "b", files)
     assert gg.run_guard(repo2, None, None)["verdict"] == "RED"
+
+
+# ---------- 2026-10-09: optional overrides, interpreter choice, CI delegation ----------
+
+def _git_repo(tmp_path, files):
+    repo = make_repo(tmp_path, files)
+    return repo
+
+
+def test_overrides_for_matches_resolved_path_and_tolerates_absence(tmp_path, monkeypatch):
+    monkeypatch.setattr(gg, "POLICY_PATH", tmp_path / "missing.json")
+    assert gg.overrides_for(tmp_path) == {}
+    pol = tmp_path / "merge-policy.json"
+    pol.write_text(json.dumps({"repos": {str(tmp_path / "r" / ".." / "r"): {"tests": "ci", "cov_path": "pkg"}}}))
+    monkeypatch.setattr(gg, "POLICY_PATH", pol)
+    (tmp_path / "r").mkdir()
+    assert gg.overrides_for(tmp_path / "r") == {"tests": "ci", "cov_path": "pkg"}
+    pol.write_text("not json")
+    assert gg.overrides_for(tmp_path / "r") == {}
+
+
+def test_select_python_prefers_override_then_project_venv_then_self(tmp_path):
+    repo = tmp_path / "repo"; pkg = repo / "pkg"
+    (pkg).mkdir(parents=True)
+    assert gg.select_python(pkg, repo) == sys.executable
+    venv_py = repo / ".venv" / "bin" / "python"
+    venv_py.parent.mkdir(parents=True); venv_py.write_text("")
+    assert gg.select_python(pkg, repo) == str(venv_py)
+    pkg_py = pkg / "venv" / "bin" / "python"
+    pkg_py.parent.mkdir(parents=True); pkg_py.write_text("")
+    assert gg.select_python(pkg, repo) == str(pkg_py)
+    assert gg.select_python(pkg, repo, "/opt/py/bin/python") == "/opt/py/bin/python"
+
+
+def test_tests_ci_delegates_coverage_and_marks_the_report(tmp_path):
+    repo = _git_repo(tmp_path, {"app.py": "x = 1\n"})
+    c = gg.check_tests_coverage_py(repo, tests="ci")
+    assert c["ok"] is True and c["delegated"] == "ci"
+    report = gg.run_guard(repo, None, None, overrides={"tests": "ci"})
+    assert report["tests"] == "ci" and report["lang"] == "python"
+    assert any(ch.get("delegated") == "ci" for ch in report["checks"])
+
+
+def test_python_lane_uses_overrides_paths_and_floor(tmp_path, monkeypatch):
+    repo = _git_repo(tmp_path, {"pkg/__init__.py": "", "pkg/m.py": "def f():\n    return 1\n",
+                                "tests/test_m.py": "from pkg.m import f\n\ndef test_f():\n    assert f() == 1\n",
+                                "junk/test_slow.py": "def test_slow():\n    assert False\n"})
+    calls = {}
+    real_run = gg.subprocess.run
+
+    class Proc:
+        returncode = 0; stdout = ""; stderr = ""
+
+    def fake_run(cmd, **kw):
+        if cmd[0] == "git":  # the guard's own `git ls-files` must stay real
+            return real_run(cmd, **kw)
+        calls["cmd"] = cmd
+        (kw["cwd"] / ".guard-cov.json").write_text(json.dumps({"totals": {"percent_covered": 55.0}}))
+        return Proc()
+    monkeypatch.setattr(gg.subprocess, "run", fake_run)
+    c = gg.check_tests_coverage_py(repo, python="/opt/py/bin/python", tests=["tests"],
+                                   cov=["pkg"], min_coverage=50)
+    assert c["ok"] is True and c["coverage"] == 55.0 and c["floor"] == 50.0
+    assert calls["cmd"][0] == "/opt/py/bin/python" and "tests" in calls["cmd"] and "--cov=pkg" in calls["cmd"]
+    assert "junk" not in calls["cmd"]
+
+
+def test_pythonpath_is_scrubbed_at_import(monkeypatch):
+    import importlib
+    monkeypatch.setenv("PYTHONPATH", "/some/engine/site-packages")
+    importlib.reload(gg)
+    assert "PYTHONPATH" not in __import__("os").environ
+
+
+# ---------- 2026-10-09: delta mode (--base) gates the branch, not legacy debt ----------
+
+def _commit_all(repo, msg):
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-q", "-m", msg], cwd=repo, check=True, capture_output=True)
+    return subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
+def _giant(n):
+    return "\n".join(f"x{i} = {i}" for i in range(n)) + "\n"
+
+
+def test_delta_mode_ignores_untouched_legacy_giants(tmp_path):
+    repo = _git_repo(tmp_path, {"legacy.py": _giant(1200), "small.py": "a = 1\n"})
+    base = _commit_all(repo, "base") if subprocess.run(["git", "status", "--porcelain"], cwd=repo,
+                                                         capture_output=True, text=True).stdout else \
+        subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True).stdout.strip()
+    (repo / "small.py").write_text("a = 2\n")
+    _commit_all(repo, "touch small")
+    assert gg.check_file_ceiling(repo)["ok"] is False          # repo-wide: legacy giant is RED
+    c = gg.check_file_ceiling(repo, base=base)
+    assert c["ok"] is True and c["offenders"] == [] and "legacy_over_ceiling" not in c
+
+
+def test_delta_mode_touched_legacy_giant_is_reported_not_red(tmp_path):
+    repo = _git_repo(tmp_path, {"legacy.py": _giant(1200)})
+    base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True).stdout.strip()
+    (repo / "legacy.py").write_text(_giant(1210))
+    _commit_all(repo, "touch the giant (+10)")
+    c = gg.check_file_ceiling(repo, base=base)
+    assert c["ok"] is True
+    assert c["legacy_over_ceiling"] == [{"file": "legacy.py", "lines": 1210, "lines_at_base": 1200}]
+
+
+def test_delta_mode_crossing_or_new_giant_is_red(tmp_path):
+    repo = _git_repo(tmp_path, {"grows.py": _giant(880)})
+    base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True).stdout.strip()
+    (repo / "grows.py").write_text(_giant(950))
+    (repo / "brand_new.py").write_text(_giant(1000))
+    _commit_all(repo, "cross + new")
+    c = gg.check_file_ceiling(repo, base=base)
+    assert c["ok"] is False
+    assert {o["file"] for o in c["offenders"]} == {"grows.py", "brand_new.py"}
+
+
+def test_delta_mode_inmemory_scans_only_changed_files(tmp_path):
+    repo = _git_repo(tmp_path, {"legacy.py": "class InMemoryRepo: pass\n", "ok.py": "a = 1\n"})
+    base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True).stdout.strip()
+    (repo / "ok.py").write_text("a = 2\n")
+    _commit_all(repo, "touch ok")
+    assert gg.check_inmemory(repo)["ok"] is False
+    assert gg.check_inmemory(repo, base=base)["ok"] is True
+    (repo / "ok.py").write_text("x = InMemoryStore()\n")
+    _commit_all(repo, "add an in-memory store")
+    assert gg.check_inmemory(repo, base=base)["ok"] is False
+
+
+def test_run_guard_records_the_base(tmp_path, monkeypatch):
+    repo = _git_repo(tmp_path, {"app.py": "x = 1\n"})
+    base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True).stdout.strip()
+    report = gg.run_guard(repo, None, None, overrides={"tests": "ci"}, base=base)
+    assert report["base"] == base and report["verdict"] == "GREEN"

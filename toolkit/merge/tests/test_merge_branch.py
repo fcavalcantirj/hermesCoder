@@ -1,12 +1,12 @@
-"""Merge-tool tests — guard is an injected fake; git is real (tmp repos).
+"""Merge + ship tool tests — guard is an injected fake; git is real (tmp repos with a
+real bare `origin`); `gh` is a recorder. No network, ever.
 
-Every refusal path is here red-on-demand: the tool must refuse loudly, never
-merge quietly. The load-bearing test is the "não pode mergear" trap — the exact
-grant phrase is a SUFFIX of its own negation, so naive substring matching would
-accept it (the classic substring false-accept class).
+Contract under test (the owner's global policy, 2026-10-09): no gate — no grant phrase,
+no policy map, any branch, any repo. What refuses: guard RED pre (refuse) / post
+(roll back), missing refs, nothing to merge, already merged, dirty tree (local lane).
+A GREEN merge ships: direct push, else PR + auto-merge; `tests: "ci"` repos only
+through the PR lane; --no-ship keeps it local.
 """
-
-import fcntl
 import json
 import subprocess
 import sys
@@ -18,21 +18,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import merge_branch as mb  # noqa: E402
 
 BRANCH = "agent/fix-thing-160450"
-GRANT = "merge allowed"
 
 
 @pytest.fixture()
 def home(tmp_path, monkeypatch):
-    h = tmp_path / "agent-home"
+    h = tmp_path / "hermescoder-home"
     h.mkdir()
     monkeypatch.setattr(mb, "HOME", h)
     monkeypatch.setattr(mb, "LOCK_PATH", h / "delegate.lock")
     monkeypatch.setattr(mb, "GUARD_PATH", h / "golden_guard.py")
-    monkeypatch.setattr(mb, "POLICY_PATH", h / "merge-policy.json")
+    monkeypatch.setattr(mb, "OVERRIDES_PATH", h / "merge-policy.json")
     monkeypatch.setattr(mb, "MERGES_LOG", h / "merges.jsonl")
     monkeypatch.setattr(mb, "WORKTREES_DIR", h / "worktrees")
-    # keep unit tests off the machine's REAL gateway store (the Pi has one)
-    monkeypatch.setattr(mb, "HERMES_STATE_DB", h / "no-state.db")
+    monkeypatch.setattr(mb, "SHIP_POLL_SECONDS", 0.0)
     return h
 
 
@@ -41,7 +39,15 @@ def _run(cwd, *a):
 
 
 @pytest.fixture()
-def repo(tmp_path, home):
+def origin(tmp_path):
+    """A real bare remote whose default branch is main."""
+    o = tmp_path / "origin.git"
+    _run(tmp_path, "git", "init", "-q", "--bare", "-b", "main", str(o))
+    return o
+
+
+@pytest.fixture()
+def repo(tmp_path, home, origin):
     r = tmp_path / "repo"
     r.mkdir()
     _run(r, "git", "init", "-q", "-b", "main")
@@ -50,13 +56,14 @@ def repo(tmp_path, home):
     (r / "README.md").write_text("fixture\n")
     _run(r, "git", "add", "-A")
     _run(r, "git", "commit", "-q", "-m", "init")
+    _run(r, "git", "remote", "add", "origin", str(origin))
+    _run(r, "git", "push", "-q", "-u", "origin", "main")
+    _run(r, "git", "remote", "set-head", "origin", "main")
     _run(r, "git", "checkout", "-q", "-b", BRANCH)
     (r / "fix.txt").write_text("fix\n")
     _run(r, "git", "add", "-A")
-    _run(r, "git", "commit", "-q", "-m", "fix")
+    _run(r, "git", "commit", "-q", "-m", "fix: the thing")
     _run(r, "git", "checkout", "-q", "main")
-    (home / "merge-policy.json").write_text(json.dumps(
-        {"repos": {str(r): {"targets": ["main"], "lang": "go"}}}))
     return r
 
 
@@ -78,129 +85,168 @@ def sha(repo, ref="HEAD"):
     return _run(repo, "git", "rev-parse", ref).stdout.strip()
 
 
-# ---------- grant parsing (the deterministic authorization gate) ----------
-
-@pytest.mark.parametrize("msg,phrase", [
-    ("merge allowed", "merge allowed"),
-    ("MERGE ALLOWED", "merge allowed"),
-    ("Merge Allowed.", "merge allowed"),
-    ("merge allowed!", "merge allowed"),
-    ("pode mergear", "pode mergear"),
-    ("Pode Mergear", "pode mergear"),
-    ("fix the login bug\n\nmerge allowed", "merge allowed"),
-    ("fix the login bug. merge allowed", "merge allowed"),
-    ("merge allowed — fix the login bug", "merge allowed"),
-    ("implementa o endpoint, pode mergear", "pode mergear"),
-])
-def test_parse_grant_accepts(msg, phrase):
-    g = mb.parse_grant(msg)
-    assert g is not None and g["phrase"] == phrase
+class FakeProc:
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
 
 
-@pytest.mark.parametrize("msg", [
-    "",
-    "please merge",
-    "merge allowed?",                   # a question is not a grant
-    "pode mergear?",
-    "não pode mergear",                 # the negation CONTAINS the grant phrase
-    "nao pode mergear",
-    "nunca pode mergear",
-    "jamais pode mergear",
-    "not merge allowed",
-    "no merge allowed",
-    "don't merge, not merge allowed",
-    "sem merge allowed",
-    "I think merge allowed is risky",   # mid-sentence: not a line, not an edge
-    "merge\nallowed",                   # phrase split across lines never grants
-])
-def test_parse_grant_refuses(msg):
-    assert mb.parse_grant(msg) is None
+def reject_main_pushes(origin: Path, ref="refs/heads/main"):
+    """A pre-receive hook that rejects updates to one ref — the ruleset stand-in."""
+    hook = origin / "hooks" / "pre-receive"
+    hook.write_text("#!/bin/sh\nwhile read old new ref; do\n"
+                    f"  [ \"$ref\" = \"{ref}\" ] && {{ echo 'rejected by ruleset' >&2; exit 1; }}\n"
+                    "done\nexit 0\n")
+    hook.chmod(0o755)
 
 
-# ---------- refusal matrix (run_merge) ----------
+class GhRecorder:
+    """Records gh calls; answers pr list/create/merge/view from a tiny state machine."""
 
-def test_no_grant_refuses_and_audits(home, repo):
+    def __init__(self, merged_after_views=1, url="https://github.com/o/r/pull/7",
+                 merge_oid="deadbeef", existing=False, create_rc=0, closed=False):
+        self.calls = []
+        self.views = 0
+        self.merged_after_views = merged_after_views
+        self.url, self.merge_oid, self.existing = url, merge_oid, existing
+        self.create_rc, self.closed = create_rc, closed
+
+    def __call__(self, repo, *args):
+        self.calls.append(args)
+        if args[:2] == ("pr", "list"):
+            return FakeProc(0, self.url + "\n" if self.existing else "")
+        if args[:2] == ("pr", "create"):
+            return FakeProc(self.create_rc, f"Creating pull request\n{self.url}\n" if self.create_rc == 0 else "",
+                            "boom" if self.create_rc else "")
+        if args[:2] == ("pr", "merge"):
+            return FakeProc(0, "")
+        if args[:2] == ("pr", "view"):
+            self.views += 1
+            if self.closed:
+                return FakeProc(0, json.dumps({"state": "CLOSED"}))
+            if self.views >= self.merged_after_views:
+                return FakeProc(0, json.dumps({"state": "MERGED", "mergedAt": "now",
+                                               "mergeCommit": {"oid": self.merge_oid}}))
+            return FakeProc(0, json.dumps({"state": "OPEN"}))
+        return FakeProc(1, "", f"unexpected gh {args}")
+
+
+# ---------- no gate: any message, any branch name, optional overrides ----------
+
+def test_any_message_merges_locally_and_audits(home, repo):
     before = sha(repo, "main")
-    v = mb.run_merge("please merge this", repo, BRANCH, guard_runner=green)
-    assert v["verdict"] == "REFUSED" and "no grant" in v["reason"]
-    assert sha(repo, "main") == before
+    v = mb.run_merge("iss it fixed? if so, ship", repo, BRANCH, guard_runner=green, ship=False)
+    assert v["verdict"] == "MERGED"
+    assert sha(repo, "main") != before
     line = json.loads((home / "merges.jsonl").read_text().splitlines()[-1])
-    assert line["verdict"] == "REFUSED"
-    assert line["grant_message"] == "please merge this"
+    assert line["verdict"] == "MERGED" and line["message"] == "iss it fixed? if so, ship"
+    assert "grant" not in line
 
 
-def test_grant_mentioning_other_branch_refuses(home, repo):
-    v = mb.run_merge("merge allowed agent/other-branch-123456", repo, BRANCH,
-                     guard_runner=green)
-    assert v["verdict"] == "REFUSED" and "mismatch" in v["reason"]
-
-
-def test_grant_mentioning_wrong_timestamp_refuses(home, repo):
-    v = mb.run_merge("merge allowed 999999", repo, BRANCH, guard_runner=green)
-    assert v["verdict"] == "REFUSED" and "mismatch" in v["reason"]
-
-
-def test_grant_mentioning_matching_timestamp_merges(home, repo):
-    v = mb.run_merge("merge allowed 160450", repo, BRANCH, guard_runner=green)
+def test_any_branch_name_is_mergeable(home, repo):
+    _run(repo, "git", "branch", "feature/x", BRANCH)
+    v = mb.run_merge("", repo, "feature/x", guard_runner=green, ship=False)
     assert v["verdict"] == "MERGED"
 
 
-def test_repo_not_in_policy_refuses(home, repo):
-    (home / "merge-policy.json").write_text(json.dumps({"repos": {}}))
-    v = mb.run_merge(GRANT, repo, BRANCH, guard_runner=green)
-    assert v["verdict"] == "REFUSED" and "policy" in v["reason"]
+def test_missing_overrides_file_is_not_a_gate(home, repo):
+    assert not (home / "merge-policy.json").exists()
+    v = mb.run_merge("", repo, BRANCH, guard_runner=green, ship=False)
+    assert v["verdict"] == "MERGED" and v["overrides"] is None
 
 
-def test_missing_policy_file_refuses(home, repo):
-    (home / "merge-policy.json").unlink()
-    v = mb.run_merge(GRANT, repo, BRANCH, guard_runner=green)
-    assert v["verdict"] == "REFUSED" and "policy" in v["reason"]
+def test_target_defaults_to_origin_head(home, repo):
+    v = mb.run_merge("", repo, BRANCH, guard_runner=green, ship=False)
+    assert v["target"] == "main"
 
 
-def test_target_not_allowed_by_policy_refuses(home, repo):
-    v = mb.run_merge(GRANT, repo, BRANCH, target="staging", guard_runner=green)
-    assert v["verdict"] == "REFUSED" and "target" in v["reason"]
-
-
-def test_default_target_comes_from_policy(home, repo):
-    v = mb.run_merge(GRANT, repo, BRANCH, guard_runner=green)
+def test_target_falls_back_to_main_without_origin_head(home, repo):
+    _run(repo, "git", "remote", "remove", "origin")
+    v = mb.run_merge("", repo, BRANCH, guard_runner=green, ship=False)
     assert v["verdict"] == "MERGED" and v["target"] == "main"
 
 
-def test_non_agent_branch_refuses(home, repo):
-    _run(repo, "git", "branch", "feature/x", BRANCH)
-    v = mb.run_merge(GRANT, repo, "feature/x", guard_runner=green)
-    assert v["verdict"] == "REFUSED" and "agent/" in v["reason"]
+def test_no_default_branch_refuses(home, repo):
+    _run(repo, "git", "remote", "remove", "origin")
+    _run(repo, "git", "checkout", "-q", BRANCH)
+    _run(repo, "git", "branch", "-D", "main")
+    v = mb.run_merge("", repo, BRANCH, guard_runner=green, ship=False)
+    assert v["verdict"] == "REFUSED" and "no target" in v["reason"]
 
+
+def test_overrides_target_and_entry_are_honoured(home, repo):
+    _run(repo, "git", "branch", "staging", "main")
+    (home / "merge-policy.json").write_text(json.dumps(
+        {"repos": {str(repo): {"target": "staging", "cov_path": "pkg"}}}))
+    v = mb.run_merge("", repo, BRANCH, guard_runner=green, ship=False)
+    assert v["verdict"] == "MERGED" and v["target"] == "staging"
+    assert v["overrides"] == {"target": "staging", "cov_path": "pkg"}
+
+
+def test_explicit_target_wins_over_overrides(home, repo):
+    _run(repo, "git", "branch", "staging", "main")
+    (home / "merge-policy.json").write_text(json.dumps({"repos": {str(repo): {"target": "staging"}}}))
+    v = mb.run_merge("", repo, BRANCH, target="main", guard_runner=green, ship=False)
+    assert v["verdict"] == "MERGED" and v["target"] == "main"
+
+
+def test_guard_runner_gets_the_overrides_key(home, repo, monkeypatch):
+    seen = {}
+
+    def fake_run_guard(path, overrides_key=None, base=None):
+        seen["key"], seen["base"] = overrides_key, base
+        return {"verdict": "GREEN", "checks": []}
+    monkeypatch.setattr(mb, "run_guard", fake_run_guard)
+    main_before = sha(repo, "main")
+    v = mb.run_merge("", repo, BRANCH, guard_runner=mb.run_guard, ship=False)
+    assert v["verdict"] == "MERGED" and seen["key"] == repo
+    # the guard gates the DELTA: base = merge-base(origin/main, branch) = main's tip before the merge
+    assert seen["base"] == v["base"] == main_before
+
+
+def test_delta_base_prefers_the_remote_target(home, repo, origin, tmp_path):
+    # advance origin/main from a second clone; the local main is now stale
+    other = tmp_path / "other"
+    _run(tmp_path, "git", "clone", "-q", str(origin), str(other))
+    _run(other, "git", "config", "user.name", "t"); _run(other, "git", "config", "user.email", "t@t")
+    (other / "remote.txt").write_text("remote change\n")
+    _run(other, "git", "add", "-A"); _run(other, "git", "commit", "-q", "-m", "remote")
+    _run(other, "git", "push", "-q", "origin", "main")
+    base = mb.delta_base(repo, BRANCH, "main")
+    # branch forked from the old main, which is an ancestor of the new origin/main
+    assert base == sha(repo, "main")
+    assert sha(repo, "origin/main") != sha(repo, "main")
+
+
+# ---------- mechanical safety (kept) ----------
 
 def test_missing_branch_refuses(home, repo):
-    v = mb.run_merge(GRANT, repo, "agent/ghost-000001", guard_runner=green)
+    v = mb.run_merge("", repo, "agent/ghost-000001", guard_runner=green, ship=False)
     assert v["verdict"] == "REFUSED" and "does not exist" in v["reason"]
 
 
 def test_nothing_to_merge_refuses(home, repo):
     _run(repo, "git", "branch", "agent/empty-000002", "main")
-    v = mb.run_merge(GRANT, repo, "agent/empty-000002", guard_runner=green)
+    v = mb.run_merge("", repo, "agent/empty-000002", guard_runner=green, ship=False)
     assert v["verdict"] == "REFUSED" and "nothing to merge" in v["reason"]
 
 
 def test_already_merged_refuses(home, repo):
     _run(repo, "git", "merge", "--no-ff", "-q", BRANCH, "-m", "manual merge")
-    v = mb.run_merge(GRANT, repo, BRANCH, guard_runner=green)
+    v = mb.run_merge("", repo, BRANCH, guard_runner=green, ship=False)
     assert v["verdict"] == "REFUSED" and "already merged" in v["reason"]
 
 
-def test_dirty_tree_refuses(home, repo):
+def test_dirty_tree_refuses_local_lane(home, repo):
     (repo / "uncommitted.txt").write_text("dirty\n")
     before = sha(repo, "main")
-    v = mb.run_merge(GRANT, repo, BRANCH, guard_runner=green)
+    v = mb.run_merge("", repo, BRANCH, guard_runner=green, ship=False)
     assert v["verdict"] == "REFUSED" and "clean" in v["reason"]
     assert sha(repo, "main") == before
 
 
 def test_guard_red_pre_merge_refuses(home, repo):
     before = sha(repo, "main")
-    v = mb.run_merge(GRANT, repo, BRANCH, guard_runner=guard_seq("RED"))
+    v = mb.run_merge("", repo, BRANCH, guard_runner=guard_seq("RED"), ship=False)
     assert v["verdict"] == "REFUSED" and "guard" in v["reason"].lower()
     assert sha(repo, "main") == before
     assert v["guard_pre"]["verdict"] == "RED"
@@ -208,7 +254,7 @@ def test_guard_red_pre_merge_refuses(home, repo):
 
 def test_guard_red_post_merge_rolls_back_exactly(home, repo):
     before = sha(repo, "main")
-    v = mb.run_merge(GRANT, repo, BRANCH, guard_runner=guard_seq("GREEN", "RED"))
+    v = mb.run_merge("", repo, BRANCH, guard_runner=guard_seq("GREEN", "RED"), ship=False)
     assert v["verdict"] == "FAIL" and "rolled back" in v["reason"]
     assert sha(repo, "main") == before
     assert v["target_sha_before"] == before
@@ -221,41 +267,30 @@ def test_merge_conflict_aborts_and_restores(home, repo):
     _run(repo, "git", "add", "-A")
     _run(repo, "git", "commit", "-q", "-m", "conflicting change on main")
     before = sha(repo, "main")
-    v = mb.run_merge(GRANT, repo, BRANCH, guard_runner=green)
+    v = mb.run_merge("", repo, BRANCH, guard_runner=green, ship=False)
     assert v["verdict"] == "FAIL" and "merge failed" in v["reason"]
     assert sha(repo, "main") == before
     assert _run(repo, "git", "status", "--porcelain").stdout.strip() == ""
 
 
-# ---------- the happy path ----------
-
-def test_merged_happy_path(home, repo):
+def test_merged_happy_path_local(home, repo):
     before = sha(repo, "main")
-    v = mb.run_merge("conserta o bug. pode mergear", repo, BRANCH,
-                     guard_runner=green)
+    v = mb.run_merge("conserta o bug", repo, BRANCH, guard_runner=green, ship=False)
     assert v["verdict"] == "MERGED"
     assert v["target_sha_before"] == before
     assert v["merge_sha"] == sha(repo, "main") != before
-    # --no-ff: the merge commit has two parents
     parents = _run(repo, "git", "rev-list", "--parents", "-1", "HEAD").stdout.split()
-    assert len(parents) == 3
-    # the authorization is permanent git history
+    assert len(parents) == 3  # --no-ff
     msg = _run(repo, "git", "log", "-1", "--format=%s").stdout
-    assert "pode mergear" in msg
-    # repo ends on the target, clean
-    cur = _run(repo, "git", "branch", "--show-current").stdout.strip()
-    assert cur == "main"
-    # audit line carries the quote and both guard hashes
+    assert "conserta o bug" in msg and BRANCH in msg
+    assert _run(repo, "git", "branch", "--show-current").stdout.strip() == "main"
     line = json.loads((home / "merges.jsonl").read_text().splitlines()[-1])
-    assert line["verdict"] == "MERGED"
-    assert line["grant_message"] == "conserta o bug. pode mergear"
-    assert line["grant"]["phrase"] == "pode mergear"
     assert line["guard_pre"]["sha256"] and line["guard_post"]["sha256"]
 
 
 def test_merge_verdict_written_to_run_jsonl(home, repo, tmp_path):
     jsonl = tmp_path / "run.jsonl"
-    v = mb.run_merge(GRANT, repo, BRANCH, guard_runner=green, jsonl=jsonl)
+    v = mb.run_merge("", repo, BRANCH, guard_runner=green, jsonl=jsonl, ship=False)
     assert v["verdict"] == "MERGED"
     last = json.loads(jsonl.read_text().splitlines()[-1])
     assert last["_type"] == "MergeVerdict" and last["verdict"] == "MERGED"
@@ -267,106 +302,117 @@ def test_pre_merge_guard_runs_on_branch_tip_worktree(home, repo):
     def spy(path):
         seen.append(Path(path))
         return {"verdict": "GREEN", "checks": []}
-    v = mb.run_merge(GRANT, repo, BRANCH, guard_runner=spy)
+    v = mb.run_merge("", repo, BRANCH, guard_runner=spy, ship=False)
     assert v["verdict"] == "MERGED"
-    # first call = temp worktree (not the repo), second = the repo post-merge
     assert seen[0] != repo and str(seen[0]).startswith(str(mb.WORKTREES_DIR))
     assert seen[1] == repo
-    # temp worktree cleaned up
     assert not seen[0].exists()
 
 
 def test_crash_still_audits_terminal_verdict(home, repo):
     def boom(path):
         raise RuntimeError("guard exploded")
-    v = mb.run_merge(GRANT, repo, BRANCH, guard_runner=boom)
+    v = mb.run_merge("", repo, BRANCH, guard_runner=boom, ship=False)
     assert v["verdict"] == "FAIL" and "guard exploded" in v["reason"]
     line = json.loads((home / "merges.jsonl").read_text().splitlines()[-1])
     assert line["verdict"] == "FAIL"
 
 
-# ---------- provenance (anti-fabrication: the grant must exist in the
-# gateway's own store, which the brain cannot write) ----------
+# ---------- ship: direct lane (real bare remote) ----------
 
-def _make_store(path, rows):
-    """rows: list of (source, role, content, ts)."""
-    import sqlite3
-    con = sqlite3.connect(path)
-    con.execute("CREATE TABLE sessions (id INTEGER PRIMARY KEY, source TEXT)")
-    con.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id INT,"
-                " role TEXT, content TEXT, timestamp REAL)")
-    for i, (source, role, content, ts) in enumerate(rows, 1):
-        con.execute("INSERT INTO sessions VALUES (?, ?)", (i, source))
-        con.execute("INSERT INTO messages VALUES (?, ?, ?, ?, ?)",
-                    (i, i, role, content, ts))
-    con.commit()
-    con.close()
+def test_ship_direct_pushes_the_target(home, repo, origin):
+    gh = GhRecorder()
+    v = mb.run_merge("", repo, BRANCH, guard_runner=green, gh=gh)
+    assert v["verdict"] == "SHIPPED" and v["via"] == "direct"
+    assert sha(origin, "main") == v["merge_sha"] == sha(repo, "main")
+    assert gh.calls == []  # no PR needed
 
 
-@pytest.fixture()
-def store(home, monkeypatch):
-    db = home / "state.db"
-
-    def _fill(rows):
-        _make_store(db, rows)
-        monkeypatch.setattr(mb, "HERMES_STATE_DB", db)
-        return db
-    return _fill
+def test_no_ship_keeps_origin_untouched(home, repo, origin):
+    before = sha(origin, "main")
+    v = mb.run_merge("", repo, BRANCH, guard_runner=green, ship=False)
+    assert v["verdict"] == "MERGED" and sha(origin, "main") == before
 
 
-def test_provenance_skipped_when_no_store(home, repo, monkeypatch):
-    monkeypatch.setattr(mb, "HERMES_STATE_DB", home / "missing.db")
-    v = mb.run_merge(GRANT, repo, BRANCH, guard_runner=green)
-    assert v["verdict"] == "MERGED"
+# ---------- ship: PR lane (remote rejects the target; recorded gh) ----------
+
+def test_rejected_push_falls_back_to_pr_lane_and_lands(home, repo, origin):
+    reject_main_pushes(origin)
+    before = sha(origin, "main")
+    gh = GhRecorder(merged_after_views=2)
+    v = mb.run_merge("ship it", repo, BRANCH, guard_runner=green, gh=gh, wait_seconds=60)
+    assert v["verdict"] == "SHIPPED" and v["via"] == "pr"
+    assert v["pr_url"] == gh.url and v["merge_sha"] == "deadbeef"
+    assert "rejected" in v["direct_push"]
+    # local main was undone (no divergence) and only fast-forwarded to origin
+    assert sha(repo, "main") == before == sha(origin, "main")
+    assert _run(repo, "git", "status", "--porcelain").stdout.strip() == ""
+    # the branch itself reached origin
+    assert sha(origin, BRANCH) == sha(repo, BRANCH)
+    kinds = [c[:2] for c in gh.calls]
+    assert kinds[:3] == [("pr", "list"), ("pr", "create"), ("pr", "merge")]
+    create = next(c for c in gh.calls if c[:2] == ("pr", "create"))
+    assert "--base" in create and "main" in create and "--head" in create and BRANCH in create
+    merge = next(c for c in gh.calls if c[:2] == ("pr", "merge"))
+    assert "--auto" in merge and "--merge" in merge
+    assert kinds.count(("pr", "view")) == 2
 
 
-def test_provenance_passes_on_real_recent_grant(home, repo, store):
-    import time as _t
-    store([("telegram", "user", "fix the bug.\nmerge allowed", _t.time() - 60)])
-    v = mb.run_merge(GRANT, repo, BRANCH, guard_runner=green)
-    assert v["verdict"] == "MERGED"
+def test_pr_lane_returns_pr_open_at_the_deadline(home, repo, origin):
+    reject_main_pushes(origin)
+    gh = GhRecorder(merged_after_views=10**6)
+    v = mb.run_merge("", repo, BRANCH, guard_runner=green, gh=gh, wait_seconds=0)
+    assert v["verdict"] == "PR_OPEN" and v["pr_url"] == gh.url and v["auto_merge"] == "armed"
+    assert sha(repo, "main") == sha(origin, "main")
 
 
-def test_provenance_refuses_fabricated_grant(home, repo, store):
-    import time as _t
-    store([("telegram", "user", "how is the branch looking?", _t.time() - 60)])
-    v = mb.run_merge(GRANT, repo, BRANCH, guard_runner=green)
-    assert v["verdict"] == "REFUSED" and "provenance" in v["reason"]
+def test_pr_lane_reuses_an_existing_open_pr(home, repo, origin):
+    reject_main_pushes(origin)
+    gh = GhRecorder(existing=True)
+    v = mb.run_merge("", repo, BRANCH, guard_runner=green, gh=gh, wait_seconds=60)
+    assert v["verdict"] == "SHIPPED"
+    assert all(c[:2] != ("pr", "create") for c in gh.calls)
 
 
-def test_provenance_negated_store_never_grants(home, repo, store):
-    # The owner really wrote the NEGATION; a fabricating brain relays the clean
-    # phrase. Substring provenance would pass ("não pode mergear" contains
-    # "pode mergear") — parse_grant on the STORED text must refuse instead.
-    import time as _t
-    store([("telegram", "user", "não pode mergear", _t.time() - 60)])
-    v = mb.run_merge("pode mergear", repo, BRANCH, guard_runner=green)
-    assert v["verdict"] == "REFUSED" and "provenance" in v["reason"]
+def test_pr_lane_closed_pr_is_a_fail(home, repo, origin):
+    reject_main_pushes(origin)
+    gh = GhRecorder(closed=True)
+    v = mb.run_merge("", repo, BRANCH, guard_runner=green, gh=gh, wait_seconds=60)
+    assert v["verdict"] == "FAIL" and "closed" in v["reason"]
 
 
-def test_provenance_stale_grant_refuses(home, repo, store):
-    import time as _t
-    store([("telegram", "user", "merge allowed", _t.time() - 3 * 24 * 3600)])
-    v = mb.run_merge(GRANT, repo, BRANCH, guard_runner=green)
-    assert v["verdict"] == "REFUSED" and "provenance" in v["reason"]
+def test_pr_lane_create_failure_is_a_fail(home, repo, origin):
+    reject_main_pushes(origin)
+    gh = GhRecorder(create_rc=1)
+    v = mb.run_merge("", repo, BRANCH, guard_runner=green, gh=gh, wait_seconds=60)
+    assert v["verdict"] == "FAIL" and "gh pr create" in v["reason"]
 
 
-def test_provenance_grant_for_other_branch_refuses(home, repo, store):
-    import time as _t
-    store([("telegram", "user", "merge allowed agent/other-999999",
-            _t.time() - 60)])
-    v = mb.run_merge(GRANT, repo, BRANCH, guard_runner=green)
-    assert v["verdict"] == "REFUSED" and "provenance" in v["reason"]
+def test_ci_oracle_repo_never_merges_locally_and_forces_pr_lane(home, repo, origin):
+    (home / "merge-policy.json").write_text(json.dumps({"repos": {str(repo): {"tests": "ci"}}}))
+    (repo / "untracked-scratch.txt").write_text("the PR lane tolerates an untracked file\n")
+    before = sha(repo, "main")
+    gh = GhRecorder()
+    v = mb.run_merge("", repo, BRANCH, guard_runner=green, gh=gh, wait_seconds=60)
+    assert v["verdict"] == "SHIPPED" and v["via"] == "pr"
+    assert "target_sha_before" not in v and "direct_push" not in v
+    assert sha(repo, "main") == before
+    assert sha(origin, BRANCH) == sha(repo, BRANCH)
 
 
-def test_provenance_ignores_non_telegram_and_non_user_rows(home, repo, store):
-    import time as _t
-    store([
-        ("cron", "user", "merge allowed", _t.time() - 60),
-        ("telegram", "assistant", "merge allowed", _t.time() - 60),
-    ])
-    v = mb.run_merge(GRANT, repo, BRANCH, guard_runner=green)
-    assert v["verdict"] == "REFUSED" and "provenance" in v["reason"]
+def test_ci_oracle_repo_refuses_no_ship(home, repo):
+    (home / "merge-policy.json").write_text(json.dumps({"repos": {str(repo): {"tests": "ci"}}}))
+    v = mb.run_merge("", repo, BRANCH, guard_runner=green, ship=False)
+    assert v["verdict"] == "REFUSED" and "tests: ci" in v["reason"]
+
+
+def test_pr_lane_fast_forwards_a_checked_out_target(home, repo, origin):
+    reject_main_pushes(origin)
+    _run(repo, "git", "checkout", "-q", "main")
+    gh = GhRecorder()
+    v = mb.run_merge("", repo, BRANCH, guard_runner=green, gh=gh, wait_seconds=60)
+    assert v["verdict"] == "SHIPPED"
+    assert _run(repo, "git", "branch", "--show-current").stdout.strip() == "main"
 
 
 # ---------- CLI entry (main): env asserts, lock, exit codes ----------
@@ -377,54 +423,77 @@ def _stub_guard(home):
         ".replace(\"'\", '\"'))\n")
 
 
-def test_main_merges_and_exits_zero(home, repo, monkeypatch, capsys):
+def test_main_ships_and_exits_zero(home, repo, origin, monkeypatch, capsys):
     _stub_guard(home)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.setattr(sys, "argv", ["merge_branch.py", "--repo", str(repo),
-                                      "--branch", BRANCH, "--grant-message", GRANT])
+                                      "--branch", BRANCH, "--message", "ship"])
     rc = mb.main()
     out = json.loads(capsys.readouterr().out)
-    assert rc == 0 and out["verdict"] == "MERGED"
+    assert rc == 0 and out["verdict"] == "SHIPPED" and out["via"] == "direct"
+    assert sha(origin, "main") == out["merge_sha"]
+
+
+def test_main_no_ship_merges_locally(home, repo, origin, monkeypatch, capsys):
+    _stub_guard(home)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    before = sha(origin, "main")
+    monkeypatch.setattr(sys, "argv", ["merge_branch.py", "--repo", str(repo),
+                                      "--branch", BRANCH, "--no-ship", "--grant-message", "legacy flag"])
+    rc = mb.main()
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 0 and out["verdict"] == "MERGED" and out["message"] == "legacy flag"
+    assert sha(origin, "main") == before
 
 
 def test_main_refusal_exits_two(home, repo, monkeypatch, capsys):
     _stub_guard(home)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    (repo / "dirty.txt").write_text("x\n")
     monkeypatch.setattr(sys, "argv", ["merge_branch.py", "--repo", str(repo),
-                                      "--branch", BRANCH,
-                                      "--grant-message", "não pode mergear"])
+                                      "--branch", BRANCH, "--no-ship"])
     rc = mb.main()
     out = json.loads(capsys.readouterr().out)
-    assert rc == 2 and out["verdict"] == "REFUSED"
+    assert rc == 2 and out["verdict"] == "REFUSED" and "clean" in out["reason"]
 
 
 def test_main_metered_key_refuses(home, repo, monkeypatch, capsys):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-nope")
     monkeypatch.setattr(sys, "argv", ["merge_branch.py", "--repo", str(repo),
-                                      "--branch", BRANCH, "--grant-message", GRANT])
+                                      "--branch", BRANCH])
     rc = mb.main()
     out = json.loads(capsys.readouterr().out)
-    assert rc == 2 and "ANTHROPIC_API_KEY" in out["reason"]
+    assert rc == 2 and out["verdict"] == "REFUSED"
 
 
 def test_main_busy_when_lock_held(home, repo, monkeypatch, capsys):
+    import fcntl
+    _stub_guard(home)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    fh = (home / "delegate.lock").open("w")
-    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    monkeypatch.setattr(sys, "argv", ["merge_branch.py", "--repo", str(repo),
-                                      "--branch", BRANCH, "--grant-message", GRANT])
-    rc = mb.main()
-    out = json.loads(capsys.readouterr().out)
-    assert rc == 3 and out["verdict"] == "BUSY"
-    fcntl.flock(fh, fcntl.LOCK_UN)
-    fh.close()
+    holder = (home / "delegate.lock").open("w")
+    fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        monkeypatch.setattr(sys, "argv", ["merge_branch.py", "--repo", str(repo),
+                                          "--branch", BRANCH])
+        rc = mb.main()
+        out = json.loads(capsys.readouterr().out)
+        assert rc == 3 and out["verdict"] == "BUSY"
+    finally:
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        holder.close()
 
 
 def test_main_not_a_repo_exits_three(home, tmp_path, monkeypatch, capsys):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    monkeypatch.setattr(sys, "argv", ["merge_branch.py", "--repo",
-                                      str(tmp_path / "nope"),
-                                      "--branch", BRANCH, "--grant-message", GRANT])
+    monkeypatch.setattr(sys, "argv", ["merge_branch.py", "--repo", str(tmp_path / "nope"),
+                                      "--branch", BRANCH])
     rc = mb.main()
     out = json.loads(capsys.readouterr().out)
-    assert rc == 3 and "not a git repo" in out["reason"]
+    assert rc == 3 and out["verdict"] == "REFUSED"
+
+
+def test_pythonpath_is_scrubbed_at_import(monkeypatch):
+    import importlib
+    monkeypatch.setenv("PYTHONPATH", "/some/engine/site-packages")
+    importlib.reload(mb)
+    assert "PYTHONPATH" not in __import__("os").environ

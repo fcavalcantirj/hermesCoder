@@ -17,7 +17,7 @@ import delegate_coder as dc  # noqa: E402
 
 @pytest.fixture()
 def home(tmp_path, monkeypatch):
-    h = tmp_path / "agent-home"
+    h = tmp_path / "hermescoder-home"
     (h / "runs").mkdir(parents=True)
     (h / "GOLDEN-RULES.md").write_text("# GOLDEN RULES (test fixture)\n")
     monkeypatch.setattr(dc, "HOME", h)
@@ -217,12 +217,21 @@ def test_crash_still_writes_terminal_verdict(home, repo):
     assert last["_type"] == "DelegateVerdict" and last["verdict"] == "FAIL"
 
 
-# ---------- fire-time merge grant (W1): default byte-identical, tool decides ----------
+# ---------- auto-land on PASS (the owner's 2026-08-18 directive); --no-merge keeps a draft ----------
 
-def test_no_grant_message_means_no_merge(home, repo):
+def test_pass_auto_lands_without_any_grant_message(home, repo):
     calls = []
     v = dc.run_task("t", repo, sdk_runner=fake_sdk(), guard_runner=guard_seq("GREEN"),
-                    merge_runner=lambda *a, **k: calls.append(a) or {})
+                    merge_runner=lambda *a, **k: calls.append(a) or {"verdict": "MERGED"})
+    assert v["verdict"] == "PASS"
+    assert v["merge"]["verdict"] == "MERGED"
+    assert len(calls) == 1 and calls[0][0] == ""  # empty message, never None
+
+
+def test_no_merge_flag_keeps_the_draft_on_its_branch(home, repo):
+    calls = []
+    v = dc.run_task("t", repo, sdk_runner=fake_sdk(), guard_runner=guard_seq("GREEN"),
+                    merge_runner=lambda *a, **k: calls.append(a) or {}, auto_merge=False)
     assert v["verdict"] == "PASS"
     assert "merge" not in v
     assert calls == []
@@ -231,8 +240,8 @@ def test_no_grant_message_means_no_merge(home, repo):
 def test_grant_on_pass_invokes_merge_with_verbatim_message(home, repo):
     seen = {}
 
-    def fake_merge(message, repo_, branch, jsonl):
-        seen.update(message=message, repo=repo_, branch=branch, jsonl=jsonl)
+    def fake_merge(message, repo_, branch, jsonl, ship=True):
+        seen.update(message=message, repo=repo_, branch=branch, jsonl=jsonl, ship=ship)
         return {"verdict": "MERGED", "merge_sha": "abc123"}
     msg = "conserta o bug do login.\npode mergear"
     v = dc.run_task("t", repo, sdk_runner=fake_sdk(), guard_runner=guard_seq("GREEN"),
@@ -266,3 +275,177 @@ def test_merge_crash_does_not_eat_task_verdict(home, repo):
     assert v["verdict"] == "PASS"
     assert v["merge"]["verdict"] == "FAIL"
     assert "merge exploded" in v["merge"]["reason"]
+
+
+# ---------- bounded-turn guard (2026-08-08: the 600s solvr-fix death) ----------
+# A foreground delegate inside a hermes gateway turn ALWAYS dies at the 600s
+# watchdog. main() must refuse (with the exact --background relaunch) when the
+# Claude Code nesting markers are present, honor --foreground as the override,
+# and keep --background's fail-fast checks (creds) SYNCHRONOUS — a bad launch
+# must report immediately, not from inside a daemon log. The fork itself is
+# deliberately untested here (double-fork under pytest is unreliable); the
+# guard/ordering contract is what regressions would break.
+
+def _main_with_argv(monkeypatch, capsys, argv, env=None):
+    monkeypatch.setattr(sys, "argv", ["delegate_coder.py", *argv])
+    for var in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "HERMES_AGENT", "AI_AGENT",
+                "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("DELEGATE_NO_REEXEC", "1")
+    for k, v in (env or {}).items():
+        monkeypatch.setenv(k, v)
+    rc = dc.main()
+    out = json.loads(capsys.readouterr().out)
+    return rc, out
+
+
+def test_bounded_turn_refuses_foreground(home, repo, monkeypatch, capsys):
+    rc, out = _main_with_argv(monkeypatch, capsys,
+                              ["--task", "t", "--repo", str(repo)],
+                              env={"CLAUDECODE": "1"})
+    assert rc == 3
+    assert out["verdict"] == "REFUSED_FOREGROUND"
+    assert "--background" in out["relaunch"]
+
+
+def test_entrypoint_marker_also_refuses(home, repo, monkeypatch, capsys):
+    rc, out = _main_with_argv(monkeypatch, capsys,
+                              ["--task", "t", "--repo", str(repo)],
+                              env={"CLAUDE_CODE_ENTRYPOINT": "cli"})
+    assert rc == 3
+    assert out["verdict"] == "REFUSED_FOREGROUND"
+
+
+def test_foreground_flag_overrides_guard(home, repo, monkeypatch, capsys):
+    # Past the guard, the credential check fires first (no claude.env in the
+    # fixture HOME) — that FAIL proves the guard let it through.
+    rc, out = _main_with_argv(monkeypatch, capsys,
+                              ["--task", "t", "--repo", str(repo), "--foreground"],
+                              env={"CLAUDECODE": "1"})
+    assert rc == 2
+    assert "CLAUDE_CODE_OAUTH_TOKEN" in out["reason"]
+
+
+def test_unbounded_env_never_refuses(home, repo, monkeypatch, capsys):
+    rc, out = _main_with_argv(monkeypatch, capsys,
+                              ["--task", "t", "--repo", str(repo)])
+    assert rc == 2
+    assert out["verdict"] == "FAIL"
+    assert "CLAUDE_CODE_OAUTH_TOKEN" in out["reason"]
+
+
+def test_background_failfast_checks_stay_synchronous(home, repo, monkeypatch, capsys):
+    # --background with missing creds must FAIL right here, synchronously —
+    # never LAUNCHED, never a fork whose only trace is a daemon log.
+    rc, out = _main_with_argv(monkeypatch, capsys,
+                              ["--task", "t", "--repo", str(repo), "--background"],
+                              env={"CLAUDECODE": "1"})
+    assert rc == 2
+    assert out["verdict"] == "FAIL"
+    assert "CLAUDE_CODE_OAUTH_TOKEN" in out["reason"]
+
+
+def test_refusal_relaunch_quotes_multiword_task(home, repo, monkeypatch, capsys):
+    rc, out = _main_with_argv(monkeypatch, capsys,
+                              ["--task", "fix the room-read auth bug",
+                               "--repo", str(repo)],
+                              env={"CLAUDECODE": "1"})
+    assert rc == 3
+    assert "'fix the room-read auth bug'" in out["relaunch"]
+
+
+# ---------- 2026-10-09: Hermes lane hygiene ----------
+
+def test_ship_flag_reaches_the_merge_runner(home, repo):
+    seen = {}
+
+    def fake_merge(message, repo_, branch, jsonl, ship=True):
+        seen["ship"] = ship
+        return {"verdict": "MERGED"}
+    v = dc.run_task("t", repo, sdk_runner=fake_sdk(), guard_runner=guard_seq("GREEN"),
+                    merge_runner=fake_merge, ship=False)
+    assert v["verdict"] == "PASS" and seen["ship"] is False
+
+
+def test_hermes_markers_refuse_foreground_with_hermes_relaunch(home, repo, monkeypatch, capsys):
+    rc, out = _main_with_argv(monkeypatch, capsys,
+                              ["--task", "fix it", "--repo", str(repo)],
+                              env={"HERMES_AGENT": "true", "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-x"})
+    assert rc == 3 and out["verdict"] == "REFUSED_FOREGROUND"
+    assert out["relaunch"].startswith("terminal(command=") and "--foreground" in out["relaunch"]
+    assert "background=true, notify_on_complete=true" in out["relaunch"]
+    assert "by hand" in out["then"]
+
+
+def test_ai_agent_marker_also_refuses(home, repo, monkeypatch, capsys):
+    rc, out = _main_with_argv(monkeypatch, capsys,
+                              ["--task", "fix it", "--repo", str(repo)],
+                              env={"AI_AGENT": "hermes-agent", "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-x"})
+    assert rc == 3 and out["verdict"] == "REFUSED_FOREGROUND"
+
+
+def test_claude_code_marker_keeps_the_background_relaunch(home, repo, monkeypatch, capsys):
+    rc, out = _main_with_argv(monkeypatch, capsys,
+                              ["--task", "fix it", "--repo", str(repo)],
+                              env={"CLAUDECODE": "1", "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-x"})
+    assert rc == 3 and out["relaunch"].endswith("--background")
+
+
+def test_message_alias_and_no_ship_parse(home, repo, monkeypatch, capsys):
+    captured = {}
+
+    def fake_run_task(task, repo_, budget, grant_message="", auto_merge=True, ship=True):
+        captured.update(message=grant_message, auto_merge=auto_merge, ship=ship)
+        return {"verdict": "PASS"}
+    monkeypatch.setattr(dc, "run_task", fake_run_task)
+    rc, out = _main_with_argv(monkeypatch, capsys,
+                              ["--task", "t", "--repo", str(repo), "--message", "ship it",
+                               "--no-ship", "--foreground"],
+                              env={"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-x"})
+    assert rc == 0 and captured == {"message": "ship it", "auto_merge": True, "ship": False}
+
+
+def test_reexec_target_points_at_the_venv_when_elsewhere(home, monkeypatch):
+    venv_py = home / "venv" / "bin" / "python"
+    venv_py.parent.mkdir(parents=True)
+    venv_py.write_text("#!/bin/sh\n")
+    monkeypatch.setattr(dc, "VENV_PYTHON", venv_py)
+    monkeypatch.delenv("DELEGATE_NO_REEXEC", raising=False)
+    assert dc.reexec_target() == str(venv_py)
+    monkeypatch.setattr(sys, "executable", str(venv_py))
+    assert dc.reexec_target() is None
+
+
+def test_reexec_target_none_without_venv_or_when_disabled(home, monkeypatch):
+    monkeypatch.setattr(dc, "VENV_PYTHON", home / "venv" / "bin" / "python")
+    monkeypatch.delenv("DELEGATE_NO_REEXEC", raising=False)
+    assert dc.reexec_target() is None
+    (home / "venv" / "bin").mkdir(parents=True)
+    (home / "venv" / "bin" / "python").write_text("")
+    monkeypatch.setenv("DELEGATE_NO_REEXEC", "1")
+    assert dc.reexec_target() is None
+
+
+def test_main_reexecs_into_the_venv(home, repo, monkeypatch, capsys):
+    venv_py = home / "venv" / "bin" / "python"
+    venv_py.parent.mkdir(parents=True)
+    venv_py.write_text("")
+    monkeypatch.setattr(dc, "VENV_PYTHON", venv_py)
+    seen = {}
+
+    def fake_execv(path, argv):
+        seen["path"], seen["argv"] = path, argv
+        raise SystemExit(99)  # execv never returns
+    monkeypatch.setattr(dc.os, "execv", fake_execv)
+    monkeypatch.setattr(sys, "argv", ["delegate_coder.py", "--task", "t", "--repo", str(repo)])
+    monkeypatch.delenv("DELEGATE_NO_REEXEC", raising=False)
+    with pytest.raises(SystemExit):
+        dc.main()
+    assert seen["path"] == str(venv_py) and seen["argv"][0] == str(venv_py) and "--task" in seen["argv"]
+
+
+def test_pythonpath_is_scrubbed_at_import(monkeypatch):
+    import importlib
+    monkeypatch.setenv("PYTHONPATH", "/some/engine/site-packages")
+    importlib.reload(dc)
+    assert "PYTHONPATH" not in __import__("os").environ

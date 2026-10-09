@@ -44,6 +44,8 @@ ENGINE_COMMIT="${ENGINE_COMMIT:-818c13be1dc4fd28987e1e881a9408224afd4535}"  # th
 PLUGIN_NAME="${PLUGIN_NAME:-claude-subscription-directsdk}"   # Hermes plugin-catalog entry (pinned sha lives in the catalog)
 CLAUDE_CODE_VERSION="${CLAUDE_CODE_VERSION:-latest}"           # npm dist-tag or exact version
 CLAUDE_CODE_MIN="${CLAUDE_CODE_MIN:-2.1.293}"                  # plugin README: Haiku 5.5 alias needs >= 2.1.293
+DELEGATE_SDK_VERSION="${DELEGATE_SDK_VERSION:-0.2.165}"   # claude-agent-sdk for the coding delegate (bundles CLI 2.1.294; cli_path uses the box claude)
+DELEGATE_VENV_EXTRAS="${DELEGATE_VENV_EXTRAS:-pytest pytest-cov ruff}"   # the guard's Python lane runs pytest under this venv when a repo has no venv of its own
 
 HERE="$(cd "$(dirname "$0")" && pwd)"          # <repo>/deploy
 ROOT="$(dirname "$HERE")"                       # <repo>
@@ -174,6 +176,13 @@ install -o "$BOX_USER" -g "$BOX_USER" -m 755 "$ROOT/toolkit/install_skill.py"   
 install -o "$BOX_USER" -g "$BOX_USER" -m 755 "$ROOT/toolkit/optimize_skill.py"         "$HOMEDIR/.hermescoder/optimize_skill.py"
 install -o "$BOX_USER" -g "$BOX_USER" -m 644 "$HERE/templates/GOLDEN-RULES.template.md" "$HOMEDIR/.hermescoder/GOLDEN-RULES.md"
 install -o "$BOX_USER" -g "$BOX_USER" -m 644 "$HERE/templates/merge-policy.json" "$HOMEDIR/.hermescoder/merge-policy.json"
+# The delegate drives the Claude Agent SDK (which in turn drives the box's `claude`):
+# it needs its own interpreter — the engine's venv is upstream's and not for us.
+say "delegate venv (claude-agent-sdk $DELEGATE_SDK_VERSION)"
+as_user "[ -d ~/.hermescoder/venv ] || python3 -m venv ~/.hermescoder/venv"
+as_user "~/.hermescoder/venv/bin/pip install -q --upgrade pip 'claude-agent-sdk==$DELEGATE_SDK_VERSION' $DELEGATE_VENV_EXTRAS 2>&1 | tail -1"
+as_user "~/.hermescoder/venv/bin/python -c 'import claude_agent_sdk, importlib.metadata as m; print(\"claude-agent-sdk\", m.version(\"claude-agent-sdk\"))'" \
+  || { echo "FATAL: claude-agent-sdk import failed in ~/.hermescoder/venv"; exit 1; }
 if ls "$ROOT"/identity/agents/*.md >/dev/null 2>&1; then
   as_user "mkdir -p ~/.hermescoder/agents"
   install -o "$BOX_USER" -g "$BOX_USER" -m 644 "$ROOT"/identity/agents/*.md "$HOMEDIR/.hermescoder/agents/"

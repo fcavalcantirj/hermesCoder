@@ -117,14 +117,14 @@ What makes them golden is enforcement, not prose: `toolkit/guard/golden_guard.py
 is a **deterministic, zero-LLM gate** — exit code is the verdict — that checks
 every delegated run, and the merge tool re-runs the full guard on the branch tip
 before anything lands. Drafts live on `agent/*` branches; merges happen only on
-your explicit grant.
+the deterministic guard (GREEN before and after the merge) — there is no grant phrase; a shipped change is pushed or lands through a PR with auto-merge, and you can keep any run as a draft with `--no-merge`.
 
 ## Security posture
 
 Secrets never live in this repo — templates only, and `scripts/secrets-scan.sh`
 (red-tested) guards every push. On the box, secrets sit in `~/.hermes/.env`
 (mode 600), the gateway answers only your allowed Telegram ids, and merges to
-your repos happen only on your explicit grant. See [SECURITY.md](SECURITY.md).
+your repos happen only when the golden guard is GREEN on the branch tip and on the merged result. See [SECURITY.md](SECURITY.md).
 
 ## License
 

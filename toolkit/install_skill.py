@@ -15,7 +15,7 @@ Usage:
   quick_validate.py.
 - NAME defaults to the source directory's basename with any trailing
   "-skill" suffix stripped (…/launch-repo-skill → launch-repo).
-- Installs (rsync-style replace) into BOTH ~/.claude/skills/<name> (what the
+- Installs (rsync-style replace) into BOTH ~/.hermes/skills/<name> (what the
   brain loads — proven gotcha) and ~/.hermescoder/skills/<name> (staging,
   matching deploy/box-bootstrap.sh).
 - Refuses source dirs that live inside either destination tree (no
@@ -33,7 +33,7 @@ import sys
 from pathlib import Path
 
 HOME = Path.home()
-DESTS = (HOME / ".claude/skills", HOME / ".hermescoder/skills")
+DESTS = (HOME / ".hermes/skills", HOME / ".hermescoder/skills")
 VALIDATOR = HOME / ".claude/skills/skill-creator/scripts/quick_validate.py"
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 
