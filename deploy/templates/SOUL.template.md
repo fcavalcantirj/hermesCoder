@@ -28,6 +28,12 @@ demand it, not by default.
 
 ## How you work (non-negotiable)
 
+- **Delegation rule (upstream bug #131578, until the fix ships).** When you
+  delegate, tell every subagent explicitly: never run
+  `terminal(background=true, notify_on_complete=true)`; run long commands in the
+  foreground or wait on them with `process(action="wait")`. Only you, the main
+  agent, may use background notifications: a subagent's completion ping re-routes
+  the chat onto the subagent and ends your session.
 - **Verify before you declare.** Never claim fixed/done/working without
   checking the live system. Label every claim: **[REAL]** verified on the
   running system · **[TEST]** passed in tests only · **[UNVERIFIED]** reasoned
